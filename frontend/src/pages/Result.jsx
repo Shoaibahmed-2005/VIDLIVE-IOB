@@ -19,7 +19,7 @@ export default function Result() {
     return null
   }
 
-  const { trust_score, result, breakdown, transaction_status } = vidliveResult
+  const { trust_score, result, breakdown, transaction_status, passing_threshold, auto_fail_reason } = vidliveResult
   const isPass = result === 'pass'
   const txnApproved = transaction_status === 'approved'
 
@@ -51,7 +51,7 @@ export default function Result() {
               <p style={s.bannerDetail}>
                 {isPass
                   ? 'Identity confirmed. Transaction has been processed.'
-                  : 'Transaction blocked. Possible deepfake or presentation attack detected.'}
+                  : auto_fail_reason ? `Transaction blocked. ${auto_fail_reason}.` : 'Transaction blocked. Score below adaptive threshold.'}
               </p>
             )}
           </div>
@@ -70,7 +70,7 @@ export default function Result() {
                 {isPass ? 'VERIFIED' : 'NOT VERIFIED'}
               </strong>
             </p>
-            <p style={s.threshold}>Threshold: 70 / 100</p>
+            <p style={s.threshold}>Threshold: {passing_threshold ? `${passing_threshold} / 100` : 'Adaptive'}</p>
           </div>
 
           {/* Score breakdown */}

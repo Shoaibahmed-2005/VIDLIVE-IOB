@@ -108,6 +108,8 @@ class SubmitScoresRequest(BaseModel):
     reaction_ms: float
     micro_expression_score: float
     frame_results: List[FrameResult]
+    avg_deepfake_conf: Optional[float] = None  # Option B: sent by frontend for adaptive threshold
+    landmarks: Optional[List[Any]] = None  # Live landmarks to verify face match
 
 
 class ScoreBreakdown(BaseModel):
@@ -123,6 +125,8 @@ class SubmitScoresResponse(BaseModel):
     breakdown: ScoreBreakdown
     transaction_status: Optional[str] = None
     enrolled: Optional[bool] = None
+    passing_threshold: Optional[float] = None
+    auto_fail_reason: Optional[str] = None
 
 
 class EnrollFaceRequest(BaseModel):

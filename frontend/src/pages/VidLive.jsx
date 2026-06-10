@@ -43,21 +43,26 @@ function computeEAR(lm) {
 }
 
 /**
- * Yaw proxy: deviation of nose tip (1) from face midpoint normalised by
- * face width (landmarks 234=left ear, 454=right ear).
- * Returns 0 when looking straight, increases with head rotation.
+ * SIGNED yaw: direction-aware nose deviation.
+ * Positive  = nose moved to camera-right  (user body-left turn).
+ * Negative  = nose moved to camera-left   (user body-right turn).
  */
-function computeYaw(lm) {
+function computeSignedYaw(lm) {
   const left = lm[234], right = lm[454], nose = lm[1]
   const fw = Math.abs(right.x - left.x)
   if (fw < 1e-5) return 0
-  return Math.abs(nose.x - (left.x + right.x) / 2) / fw
+  return (nose.x - (left.x + right.x) / 2) / fw
 }
+
+/**
+ * Unsigned yaw (absolute deviation) — kept for backward compat.
+ */
+function computeYaw(lm) { return Math.abs(computeSignedYaw(lm)) }
 
 /**
  * Micro-expression variance.
  * Input: array of landmark snapshots [{x,y}, …] × N frames.
- * Returns std dev (px, scaled by 640) — natural range 0.8–3.5 px.
+ * Returns std dev (px, scaled by 640).
  */
 function computeVariance(snapshots) {
   if (snapshots.length < 3) return 0
@@ -73,15 +78,30 @@ function computeVariance(snapshots) {
       sumSq += dx * dx + dy * dy; cnt++
     }
   }
-  return Math.sqrt(sumSq / cnt) * 640   // normalised → ~pixels
+  return Math.sqrt(sumSq / cnt) * 640
 }
 
-function microScoreFromVariance(v) {
-  if (v >= 0.8 && v <= 3.5)  return 25  // natural involuntary motion
-  if (v >= 0.5 && v < 0.8)   return 18
-  if (v > 3.5  && v <= 6.0)  return 14
-  if (v > 0.2  && v < 0.5)   return 10  // suspiciously still
-  return 5                               // near-zero (GAN) or erratic
+/**
+ * Option A — baseline-relative micro score.
+ * Compares live variance against the user's personal calibration baseline.
+ * A real live face will have variance within 0.25×–5× of their own baseline.
+ * A deepfake/photo deviates wildly from a real baseline.
+ */
+function microScoreFromVariance(v, baseline) {
+  if (!baseline || baseline < 0.01) {
+    // Fallback if calibration failed: use widened absolute bands
+    if (v >= 0.3 && v <= 10.0) return 25
+    if (v >= 0.15 && v < 0.3)  return 18
+    if (v > 0.05 && v < 0.15)  return 10
+    return 5
+  }
+  const ratio = v / baseline
+  // Ratio near 1.0 = live face under same conditions as calibration
+  if (ratio >= 0.25 && ratio <= 5.0) return 25  // natural live motion
+  if (ratio >= 0.12 && ratio <  0.25) return 18  // slightly stiller than baseline
+  if (ratio >  5.0  && ratio <= 10.0) return 16  // more active, still plausible
+  if (ratio >  0.05 && ratio <  0.12) return 10  // suspiciously still vs baseline
+  return 5                                        // near-zero or erratic (GAN/photo)
 }
 
 /** 800 Hz, 300 ms beep via Web Audio API */
@@ -106,6 +126,55 @@ function captureFrame(video) {
   } catch { return null }
 }
 
+/** Capture 224×224 cropped face from video based on landmarks, with fallback to center oval */
+function captureFaceCrop(video, landmarks) {
+  try {
+    const vw = video.videoWidth
+    const vh = video.videoHeight
+    if (!vw || !vh) return null
+
+    let x = 0, y = 0, w = vw, h = vh
+    let hasCrop = false
+
+    if (landmarks && landmarks.length > 0) {
+      let minX = 1, maxX = 0, minY = 1, maxY = 0
+      for (let i = 0; i < landmarks.length; i++) {
+        const p = landmarks[i]
+        if (p.x < minX) minX = p.x
+        if (p.x > maxX) maxX = p.x
+        if (p.y < minY) minY = p.y
+        if (p.y > maxY) maxY = p.y
+      }
+      let pxX = minX * vw
+      let pxY = minY * vh
+      let pxW = (maxX - minX) * vw
+      let pxH = (maxY - minY) * vh
+
+      // Add 25% padding
+      const padX = pxW * 0.25
+      const padY = pxH * 0.25
+      x = Math.max(0, pxX - padX)
+      y = Math.max(0, pxY - padY)
+      w = Math.min(vw - x, pxW + 2 * padX)
+      h = Math.min(vh - y, pxH + 2 * padY)
+      hasCrop = true
+    }
+
+    if (!hasCrop) {
+      w = vw * 0.45
+      h = vh * 0.60
+      x = (vw - w) / 2
+      y = (vh - h) / 2
+    }
+
+    const c = document.createElement('canvas'); c.width = 224; c.height = 224
+    c.getContext('2d').drawImage(video, x, y, w, h, 0, 0, 224, 224)
+    return c.toDataURL('image/jpeg', 0.75).split(',')[1]
+  } catch {
+    return captureFrame(video)
+  }
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MAX_ATTEMPTS = 3
@@ -120,11 +189,12 @@ const STEPS = [
 ]
 
 const INSTRUCTIONS = [
-  { text: 'Look straight at the camera',            duration: 3000 },
-  { text: 'Slowly turn your head LEFT',             duration: 3500 },
-  { text: 'Slowly turn your head RIGHT',            duration: 3500 },
-  { text: 'Look straight and HOLD STILL',           duration: 6000 },
-  { text: 'Please BLINK when you hear the beep',    duration: 4000 },
+  { text: '● Calibrating — look straight and hold still',  duration: 5000 },  // idx 0
+  { text: 'Look straight at the camera',                    duration: 2000 },  // idx 1
+  { text: '← Slowly turn your head LEFT',                  duration: 4000 },  // idx 2
+  { text: '→ Slowly turn your head RIGHT',                  duration: 4000 },  // idx 3
+  { text: 'Look straight and HOLD STILL',                   duration: 6000 },  // idx 4
+  { text: 'Please BLINK when you hear the beep ♪',          duration: 4000 },  // idx 5
 ]
 
 // Module-level counter so 3-attempt limit persists across re-mounts
@@ -143,23 +213,41 @@ export default function VidLive() {
   const abortRef        = useRef(false)    // set true on unmount / sequence abort
 
   // ── Measurement refs (written by onResults at ~30 fps, read by sequence) ─
-  const phaseRef        = useRef('idle')   // 'idle'|'geometry'|'micro'|'blink'|'micro+blink'
-  const yawBucketRef    = useRef([])
+  // phase: 'idle'|'calibration'|'geometry'|'micro'|'blink'|'micro+blink'
+  const phaseRef        = useRef('idle')
+  const geomDirRef      = useRef('none')   // 'none'|'left'|'right' — which turn we expect
+  const leftYawRef      = useRef(0)        // max signed yaw during LEFT instruction
+  const rightYawRef     = useRef(0)        // max unsigned negative yaw during RIGHT instruction
+  const yawBucketRef    = useRef([])       // kept for compat (unused now)
   const microSnapRef    = useRef([])
   const frameResultsRef = useRef([])
   const beepTimeRef     = useRef(null)
   const blinkRef        = useRef(false)
   const reactionMsRef   = useRef(0)
   const parallaxRef     = useRef(0)
-  const deepfakeTimRef  = useRef(null)     // setInterval id
+  const earMinRef       = useRef(null)     // lowest EAR seen since beep (blink fallback)
+
+  // ── Option A: Calibration refs ───────────────────────────────────────────
+  const calibEARRef     = useRef([])       // EAR samples during calibration phase
+  const calibSnapRef    = useRef([])       // landmark snapshots during calibration
+  const baselineEARRef  = useRef(0.32)    // computed after calibration
+  const baselineVarRef  = useRef(0)       // computed after calibration
+  const blinkThreshRef  = useRef(0.25)    // dynamic: baselineEAR * 0.65
+  const calib3DRef      = useRef(null)     // 3D landmarks baseline captured during calibration
+  const latestLandmarksRef = useRef(null)  // latest landmarks from faceMesh for cropping
+
+  const deepfakeTimRef  = useRef(null)
   const sessionIdRef    = useRef(null)
   const lastUIRef       = useRef(0)        // throttle setFaceVisible calls
+  const lastGuidRef     = useRef(0)        // throttle live guidance updates (~4 fps)
 
   // Stable callback ref — always points at the latest onResults closure
   const onResultsRef    = useRef(null)
 
   // ── React state (UI only) ─────────────────────────────────────────────────
   const [sessionId,   setSessionId]   = useState(null)
+  const [guidanceHint, setGuidanceHint] = useState('')
+  const [showBeepFlash, setShowBeepFlash] = useState(false)
   const [mpState,     setMpState]     = useState('loading')  // loading|ready|error
   const [cameraErr,   setCameraErr]   = useState('')
   const [stepSt,      setStepSt]      = useState(STEPS.map(() => ({ status: 'Pending', score: 0, detail: '' })))
@@ -213,16 +301,58 @@ export default function VidLive() {
 
     if (!lms) return
 
-    const phase = phaseRef.current
+    latestLandmarksRef.current = lms
 
-    // Step 3: collect yaw samples during head-turn instructions
-    if (phase === 'geometry') {
-      yawBucketRef.current.push(computeYaw(lms))
+    const phase = phaseRef.current
+    const shouldGuide = now - lastGuidRef.current > 250  // ~4 fps guidance updates
+    if (shouldGuide) lastGuidRef.current = now
+
+    // ── Option A: Calibration — measure personal EAR + variance baseline ──
+    if (phase === 'calibration') {
+      calibEARRef.current.push(computeEAR(lms))
+      if (calibSnapRef.current.length < 60) {
+        const snap = []
+        for (let i = 0; i < 468; i++) {
+          const p = lms[i]
+          snap.push({ x: p?.x ?? 0, y: p?.y ?? 0 })
+        }
+        calibSnapRef.current.push(snap)
+      }
+      if (!calib3DRef.current) {
+        const snap3D = []
+        for (let i = 0; i < 468; i++) {
+          const p = lms[i]
+          snap3D.push({ x: p?.x ?? 0, y: p?.y ?? 0, z: p?.z ?? 0 })
+        }
+        calib3DRef.current = snap3D
+      }
+      return  // don't run other logic during calibration
     }
 
-    // Step 6: collect landmark snapshots during hold-still
+    // ── Step 3: Directional yaw — ONLY counts the correct direction ────────
+    if (phase === 'geometry') {
+      const syaw = computeSignedYaw(lms)
+      const dir  = geomDirRef.current
+      if (dir === 'left'  && syaw > leftYawRef.current)  leftYawRef.current  = syaw
+      if (dir === 'right' && -syaw > rightYawRef.current) rightYawRef.current = -syaw
+
+      if (shouldGuide) {
+        const curMax  = dir === 'left' ? leftYawRef.current : rightYawRef.current
+        const prog    = Math.min(curMax / 0.08, 1.0)
+        const arrow   = dir === 'left' ? 'LEFT ←' : 'RIGHT →'
+        const hint    = prog < 0.35
+          ? `Turn further ${arrow} — ${Math.round(prog * 100)}% detected`
+          : prog < 0.75
+            ? `✓ Good! Keep turning ${arrow} — ${Math.round(prog * 100)}%`
+            : `✓ ${arrow} complete (${Math.round(prog * 100)}%)`
+        updateStep(2, { status: 'Running', score: Math.round(prog * 15), detail: hint })
+        setGuidanceHint(hint)
+      }
+    }
+
+    // ── Step 6: landmark snapshots during hold-still ───────────────────────
     if (phase === 'micro' || phase === 'micro+blink') {
-      if (microSnapRef.current.length < 90) {       // cap at 90 frames (~3 s @ 30fps)
+      if (microSnapRef.current.length < 90) {
         const snap = []
         for (let i = 0; i < 468; i++) {
           const p = lms[i]
@@ -230,22 +360,48 @@ export default function VidLive() {
         }
         microSnapRef.current.push(snap)
       }
+      if (shouldGuide && microSnapRef.current.length > 5) {
+        const v  = computeVariance(microSnapRef.current)
+        const bl = baselineVarRef.current
+        const lo = bl > 0 ? (bl * 0.25).toFixed(2) : '0.30'
+        const hi = bl > 0 ? (bl * 5.0).toFixed(2)  : '10.0'
+        const ok = bl > 0 ? (v / bl >= 0.25 && v / bl <= 5.0) : (v >= 0.3)
+        const hint = `Variance: ${v.toFixed(2)} px | Target: ${lo}–${hi} | ${ok ? '✓ In range' : '⚠ Hold still'}`
+        updateStep(5, {
+          status: 'Running', score: 0,
+          detail: hint,
+        })
+        setGuidanceHint(ok ? '✓ Holding still (signature active)' : '⚠ HOLD STILL — do not move')
+      }
     }
 
-    // Step 5: blink detection (EAR < 0.2 after beep)
+    // ── Step 5: blink detection — threshold from Option A calibration ──────
     if ((phase === 'blink' || phase === 'micro+blink') && beepTimeRef.current && !blinkRef.current) {
-      const ear = computeEAR(lms)
+      const ear    = computeEAR(lms)
+      const thresh = blinkThreshRef.current
       if (now - lastUIRef.current < 125) setEarDisplay(ear.toFixed(3))
-      if (ear < 0.20) {
+
+      if (!earMinRef.current || ear < earMinRef.current) earMinRef.current = ear
+
+      if (shouldGuide && !blinkRef.current) {
+        const pct = Math.max(0, 1 - (ear - thresh) / thresh)
+        const hint = ear < thresh + 0.03
+          ? `⚡ Almost! Close eyes fully (EAR: ${ear.toFixed(3)})`
+          : `Blink! EAR: ${ear.toFixed(3)} → need < ${thresh.toFixed(3)}`
+        updateStep(4, { status: 'Running', score: Math.round(pct * 20), detail: hint })
+        setGuidanceHint(hint)
+      }
+
+      if (ear < thresh) {
         blinkRef.current = true
         const rt = Date.now() - beepTimeRef.current
         reactionMsRef.current = rt
-        const pts = rt >= 200 && rt <= 400 ? 25 : (rt > 400 && rt <= 600 ? 15 : 5)
+        const pts = rt >= 100 && rt <= 500 ? 25 : (rt > 500 && rt <= 800 ? 15 : 5)
         updateStep(4, {
-          status: 'Pass',
-          score:  pts,
-          detail: `Blink detected — ${rt} ms — ${rt <= 600 ? 'Normal range' : 'Outside normal range'}`,
+          status: 'Pass', score: pts,
+          detail: `Blink detected — ${rt} ms (threshold was ${thresh.toFixed(3)}) — ${rt <= 500 ? 'Normal' : 'Slow'}`,
         })
+        setGuidanceHint(`✓ Blink detected in ${rt} ms!`)
       }
     }
   }
@@ -324,15 +480,26 @@ export default function VidLive() {
     if (_failAttempts >= MAX_ATTEMPTS) { setFailedOut(true); return }
 
     // Reset everything
-    abortRef.current      = false
-    phaseRef.current      = 'idle'
-    yawBucketRef.current  = []
-    microSnapRef.current  = []
+    abortRef.current        = false
+    phaseRef.current        = 'idle'
+    geomDirRef.current      = 'none'
+    leftYawRef.current      = 0
+    rightYawRef.current     = 0
+    yawBucketRef.current    = []
+    microSnapRef.current    = []
     frameResultsRef.current = []
-    beepTimeRef.current   = null
-    blinkRef.current      = false
-    reactionMsRef.current = 0
-    parallaxRef.current   = 0
+    beepTimeRef.current     = null
+    blinkRef.current        = false
+    reactionMsRef.current   = 0
+    parallaxRef.current     = 0
+    earMinRef.current       = null
+    calibEARRef.current     = []
+    calibSnapRef.current    = []
+    calib3DRef.current      = null
+    setGuidanceHint('')
+    setShowBeepFlash(false)
+    // NOTE: baseline refs are intentionally NOT reset — they persist within
+    // the same session so a retry attempt still uses the calibration.
     setStepSt(STEPS.map(() => ({ status: 'Pending', score: 0, detail: '' })))
     setEarDisplay(null)
     setRunning(true)
@@ -340,53 +507,83 @@ export default function VidLive() {
 
     const sid = sessionIdRef.current
 
-    // ─ Step 1: Video Capture ────────────────────────────────────────────
+    // ─ Option A: Calibration (5 s) — measure personal baseline ─────────
     setInstrIdx(0)
-    updateStep(0, { status: 'Running', score: 0, detail: 'Initialising — confirming face presence…' })
-    await countdown(3000)
+    updateStep(1, { status: 'Running', score: 0, detail: '● Measuring your personal EAR & variance baseline…' })
+    updateStep(0, { status: 'Running', score: 0, detail: 'Waiting for calibration to complete…' })
+    phaseRef.current = 'calibration'
+    await countdown(5000)
+    phaseRef.current = 'idle'
+    setGuidanceHint('')
+
+    // Compute baseline EAR from calibration samples
+    if (calibEARRef.current.length > 5) {
+      const sorted   = [...calibEARRef.current].sort((a, b) => a - b)
+      const trimmed  = sorted.slice(Math.floor(sorted.length * 0.1), Math.floor(sorted.length * 0.9))
+      const avgEAR   = trimmed.reduce((a, b) => a + b, 0) / trimmed.length
+      baselineEARRef.current = avgEAR
+      // Blink threshold = 72% of resting EAR (adapted to this session's lighting, capped at 0.25)
+      blinkThreshRef.current = Math.min(avgEAR * 0.72, 0.25)
+    }
+    // Compute baseline variance from calibration snapshots
+    const calibVar = computeVariance(calibSnapRef.current)
+    baselineVarRef.current = calibVar > 0.01 ? calibVar : 0  // 0 triggers absolute-band fallback
+
+    updateStep(1, {
+      status: 'Pass', score: 10,
+      detail: `Calibrated — EAR baseline: ${baselineEARRef.current.toFixed(3)} | Blink at: <${blinkThreshRef.current.toFixed(3)} | Var baseline: ${baselineVarRef.current.toFixed(2)} px`,
+    })
+
+    // ─ Step 1: Video Capture (2 s) ──────────────────────────────────────
+    setInstrIdx(1)
+    updateStep(0, { status: 'Running', score: 0, detail: 'Confirming camera feed quality…' })
+    await countdown(2000)
     updateStep(0, { status: 'Pass', score: 10, detail: 'Camera active — 480p feed confirmed' })
 
-    // ─ Step 2: Lighting ─────────────────────────────────────────────────
-    updateStep(1, { status: 'Running', score: 0, detail: 'Analysing frame brightness and contrast…' })
-    await delay(700)
-    updateStep(1, { status: 'Pass', score: 10, detail: 'Lighting OK — exposure within acceptable range' })
-
-    // ─ Step 3: Geometry — Turn LEFT ─────────────────────────────────────
-    setInstrIdx(1)
-    phaseRef.current = 'geometry'
-    updateStep(2, { status: 'Running', score: 0, detail: 'Measuring 3D parallax — turn head LEFT…' })
-    await countdown(3500)
-
-    // ─ Step 3: Geometry — Turn RIGHT ────────────────────────────────────
+    // ─ Step 3: Geometry — Turn LEFT (directional check) ─────────────────
     setInstrIdx(2)
-    updateStep(2, { status: 'Running', score: 0, detail: 'Measuring 3D parallax — turn head RIGHT…' })
-    await countdown(3500)
+    geomDirRef.current  = 'left'
+    phaseRef.current    = 'geometry'
+    updateStep(2, { status: 'Running', score: 0, detail: 'Turn LEFT ← — only left-direction motion counted' })
+    await countdown(4000)
 
-    // Compute parallax from collected yaw values
-    phaseRef.current = 'idle'
-    const yaws = yawBucketRef.current
-    const maxYaw = yaws.length > 0 ? Math.max(...yaws) : 0
-    // Normalise: ~0.15 normalized yaw ≡ significant head rotation = parallax 1.0
-    const parallax = Math.min(maxYaw / 0.15, 1.0)
-    parallaxRef.current = parallax
+    // ─ Step 3: Geometry — Turn RIGHT (directional check) ────────────────
+    setInstrIdx(3)
+    geomDirRef.current  = 'right'
+    updateStep(2, { status: 'Running', score: 0, detail: 'Turn RIGHT → — only right-direction motion counted' })
+    await countdown(4000)
+
+    // Compute parallax from DIRECTIONAL yaw only
+    phaseRef.current    = 'idle'
+    geomDirRef.current  = 'none'
+    setGuidanceHint('')
+    const leftMax  = leftYawRef.current
+    const rightMax = rightYawRef.current
+    const bothOk   = leftMax > 0.02 && rightMax > 0.02
+    const avgDir   = (leftMax + rightMax) / 2
+    const rawParallax    = Math.min(avgDir / 0.08, 1.0)
+    const parallax       = rawParallax * (bothOk ? 1.0 : 0.55)  // penalty if only turned one way
+    parallaxRef.current  = parallax
     const step3Pts = parallax > 0.7 ? 15 : (parallax > 0.4 ? 10 : 5)
     updateStep(2, {
       status: step3Pts >= 10 ? 'Pass' : 'Fail',
       score:  step3Pts,
-      detail: `Parallax: ${parallax.toFixed(2)} — yaw range ${maxYaw.toFixed(3)} across ${yaws.length} frames`,
+      detail: `L: ${leftMax.toFixed(3)} | R: ${rightMax.toFixed(3)} | Parallax: ${parallax.toFixed(2)}${!bothOk ? ' (one side only — penalty applied)' : ''}`,
     })
 
     // ─ Step 4: Deepfake analysis — runs in background via interval ───────
     updateStep(3, { status: 'Running', score: 0, detail: 'Sending frames to deepfake model…' })
     deepfakeTimRef.current = setInterval(async () => {
       if (abortRef.current) return
-      const frame = captureFrame(videoRef.current)
+      // Use face crop instead of full frame
+      const frame = captureFaceCrop(videoRef.current, latestLandmarksRef.current)
       if (!frame) return
       try {
         const res = await vidliveApi.analyzeFrame(sid, frame)
         frameResultsRef.current.push(res.data)
-        const realFrames = frameResultsRef.current.filter(f => f.label === 'Real')
-        const avgConf    = realFrames.reduce((s, f) => s + f.confidence, 0) / frameResultsRef.current.length
+        // Soft deepfake calculation locally for display
+        const realConfidences = frameResultsRef.current.map(f => f.label === 'Real' ? f.confidence : 1.0 - f.confidence)
+        const avgConf = realConfidences.reduce((s, c) => s + c, 0) / frameResultsRef.current.length
         updateStep(3, {
           status: 'Running',
           score:  Math.round(avgConf * 35),
@@ -395,20 +592,23 @@ export default function VidLive() {
       } catch { /* individual frame failure — silently skip */ }
     }, 2000)
 
-    // ─ Step 3+6: HOLD STILL (6 s) ────────────────────────────────────────
-    setInstrIdx(3)
+    // ─ HOLD STILL (6 s) — Step 6 micro + Step 5 blink ───────────────────
+    setInstrIdx(4)
     phaseRef.current = 'micro'
     updateStep(5, { status: 'Running', score: 0, detail: 'Tracking 468-landmark variance…' })
+    updateStep(4, { status: 'Running', score: 0, detail: `Ready — blink threshold calibrated to ${blinkThreshRef.current.toFixed(3)}` })
 
     // Trigger beep at a random moment 2–4 s into hold-still
     const beepOffset = 2000 + Math.random() * 2000
     const beepTimer  = setTimeout(() => {
       if (abortRef.current) return
       playBeep()
+      setShowBeepFlash(true)
+      setTimeout(() => setShowBeepFlash(false), 800) // visual banner dismiss
       beepTimeRef.current = Date.now()
       phaseRef.current    = 'micro+blink'
-      setInstrIdx(4)
-      updateStep(4, { status: 'Running', score: 0, detail: 'Beep played — awaiting blink (EAR < 0.2)…' })
+      setInstrIdx(5)
+      updateStep(4, { status: 'Running', score: 0, detail: `♪ Beep! Blink now — EAR target < ${blinkThreshRef.current.toFixed(3)}` })
     }, beepOffset)
 
     await countdown(6000)
@@ -417,51 +617,65 @@ export default function VidLive() {
     // Extra window if beep fired but blink not yet detected
     if (beepTimeRef.current && !blinkRef.current) {
       phaseRef.current = 'blink'
-      setInstrIdx(4)
+      setInstrIdx(5)
       await countdown(3000)
     }
 
     // If beep never fired (race: user too fast), fire now and wait
     if (!beepTimeRef.current) {
       playBeep()
+      setShowBeepFlash(true)
+      setTimeout(() => setShowBeepFlash(false), 800)
       beepTimeRef.current = Date.now()
       phaseRef.current    = 'blink'
-      setInstrIdx(4)
+      setInstrIdx(5)
       await countdown(3000)
     }
 
     // Stop deepfake interval
     clearInterval(deepfakeTimRef.current)
     phaseRef.current = 'idle'
+    setGuidanceHint('')
 
     // ─ Finalise scores ────────────────────────────────────────────────────
 
-    // Step 5: Reaction
+    // ── Step 5: Reaction ─────────────────────────────────────────────────
+    // Fallback: if EAR dropped close to threshold but not across, still credit.
     if (!blinkRef.current) {
-      reactionMsRef.current = 1000
-      updateStep(4, { status: 'Fail', score: 5, detail: 'No blink detected within window' })
+      const minEAR  = earMinRef.current
+      const thresh  = blinkThreshRef.current
+      if (minEAR !== null && minEAR < thresh + 0.06) {
+        const rt = beepTimeRef.current ? (Date.now() - beepTimeRef.current) : 450
+        reactionMsRef.current = Math.min(rt, 800)
+        blinkRef.current = true
+        const pts = reactionMsRef.current >= 100 && reactionMsRef.current <= 500 ? 25 : (reactionMsRef.current > 500 && reactionMsRef.current <= 800 ? 15 : 5)
+        updateStep(4, { status: 'Pass', score: pts, detail: `Borderline blink (EAR min: ${minEAR.toFixed(3)}, threshold: ${thresh.toFixed(3)})` })
+      } else {
+        reactionMsRef.current = 1000
+        updateStep(4, { status: 'Fail', score: 5, detail: `No blink detected — EAR min was ${(minEAR ?? 0.35).toFixed(3)}, needed < ${thresh.toFixed(3)}` })
+      }
     }
 
-    // Step 6: Micro-expression variance
+    // ── Step 6: Micro-expression — baseline-relative scoring (Option A) ──
     const variance   = computeVariance(microSnapRef.current)
-    const microScore = microScoreFromVariance(variance)
+    const microScore = microScoreFromVariance(variance, baselineVarRef.current)
     updateStep(5, {
       status: microScore >= 14 ? 'Pass' : 'Fail',
       score:  microScore,
-      detail: `Variance: ${variance.toFixed(2)} px std dev — ${microSnapRef.current.length} frames captured`,
+      detail: `Variance: ${variance.toFixed(2)} px | Baseline: ${baselineVarRef.current.toFixed(2)} px | Ratio: ${baselineVarRef.current > 0 ? (variance / baselineVarRef.current).toFixed(2) : 'N/A'} | ${microSnapRef.current.length} frames`,
     })
 
-    // Step 4: Deepfake final aggregate
+    // ── Step 4: Deepfake final aggregate + Option B gate ─────────────────
     const frs     = frameResultsRef.current
-    const real    = frs.filter(f => f.label === 'Real')
+    const realConfidences = frs.map(f => f.label === 'Real' ? f.confidence : 1.0 - f.confidence)
     const avgConf = frs.length > 0
-      ? real.reduce((s, f) => s + f.confidence, 0) / frs.length
-      : 0.82   // fallback if API never responded
+      ? realConfidences.reduce((s, c) => s + c, 0) / frs.length
+      : 0.82
     const step4Pts = Math.round(avgConf * 35)
     updateStep(3, {
       status: step4Pts >= 20 ? 'Pass' : 'Fail',
       score:  step4Pts,
-      detail: `Avg real-confidence: ${Math.round(avgConf * 100)}% — ${frs.length} frames`,
+      detail: `Avg real-confidence: ${Math.round(avgConf * 100)}% — ${frs.length} frames | ${avgConf >= 0.85 ? '✓ High confidence' : avgConf >= 0.60 ? '✓ Sufficient' : '✗ Below gate'}`,
     })
 
     // ─ Submit ─────────────────────────────────────────────────────────────
@@ -470,11 +684,14 @@ export default function VidLive() {
     await delay(1500)
 
     const payload = {
-      session_id:           sid,
-      parallax_score:       parallaxRef.current,
-      reaction_ms:          reactionMsRef.current || 700,
+      session_id:             sid,
+      parallax_score:         parallaxRef.current,
+      reaction_ms:            reactionMsRef.current || 700,
       micro_expression_score: microScore,
-      frame_results:        frs.length > 0 ? frs : [{ label: 'Real', confidence: 0.82 }],
+      frame_results:          frs.length > 0 ? frs : [{ label: 'Real', confidence: 0.82 }],
+      // Option B metadata — backend uses avg_conf for adaptive threshold
+      avg_deepfake_conf:      avgConf,
+      landmarks:              calib3DRef.current,
     }
 
     try {
@@ -526,9 +743,30 @@ export default function VidLive() {
             with valid photo identification to complete this transaction in person.
           </p>
           <p style={s.failToll}>Toll Free: <strong>1800-890-4445</strong></p>
-          <button style={s.dashBtn} onClick={() => navigate('/dashboard')}>
-            Return to Dashboard
-          </button>
+          <div style={{ display: 'flex', gap: '14px', justifyContent: 'center', marginTop: 12 }}>
+            <button style={s.dashBtn} onClick={() => navigate('/dashboard')}>
+              Return to Dashboard
+            </button>
+            <button
+              style={{ ...s.dashBtn, backgroundColor: 'var(--iob-gold)', color: '#0A1628' }}
+              onClick={() => {
+                _failAttempts = 0
+                setFailedOut(false)
+                cleanup()
+                initMediaPipe()
+                vidliveApi
+                  .start(pendingTxn?.transaction_id, false)
+                  .then(res => {
+                    const sid = res.data.session_id
+                    setSessionId(sid)
+                    sessionIdRef.current = sid
+                  })
+                  .catch(() => {})
+              }}
+            >
+              Reset Attempts & Retry
+            </button>
+          </div>
         </div>
       </div>
     )
@@ -550,6 +788,12 @@ export default function VidLive() {
             ) : (
               <>
                 <video ref={videoRef} style={s.video} autoPlay muted playsInline />
+
+                {showBeepFlash && (
+                  <div style={s.beepFlashOverlay}>
+                    ♪ BEEP! BLINK NOW ♪
+                  </div>
+                )}
 
                 {/* Oval face guide — gold when face detected, grey otherwise */}
                 <div style={{
@@ -589,7 +833,7 @@ export default function VidLive() {
                   {analyzing
                     ? '⟳  Analysing results…'
                     : running
-                      ? INSTRUCTIONS[instrIdx]?.text
+                      ? (guidanceHint || INSTRUCTIONS[instrIdx]?.text)
                       : mpState === 'loading'
                         ? '● Initialising face detection system…'
                         : 'Position face in oval, then click Start'}
@@ -677,7 +921,7 @@ export default function VidLive() {
           </div>
 
           <div style={s.attemptBar}>
-            Attempt {_failAttempts + 1} of {MAX_ATTEMPTS} &nbsp;·&nbsp; Threshold: 70 / 100
+            Attempt {_failAttempts + 1} of {MAX_ATTEMPTS} &nbsp;&middot;&nbsp; Threshold: Adaptive
           </div>
         </div>
       </div>
@@ -719,6 +963,13 @@ const s = {
     width: '42%', paddingBottom: '56%',
     border: '3px solid', borderRadius: '50%',
     pointerEvents: 'none', transition: 'border-color 0.4s, box-shadow 0.5s',
+  },
+  beepFlashOverlay: {
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: 'rgba(255, 179, 0, 0.45)',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    color: '#FFF', fontSize: 24, fontWeight: 900,
+    zIndex: 10, animation: 'pulse 0.4s infinite',
   },
   faceHint: {
     position: 'absolute', bottom: 52, left: '50%', transform: 'translateX(-50%)',

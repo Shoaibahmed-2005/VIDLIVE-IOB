@@ -103,6 +103,7 @@ export default function Enroll() {
   const blinkRef       = useRef(false)
   const reactionMsRef  = useRef(0)
   const lastUIRef      = useRef(0)
+  const lastGuidRef     = useRef(0)
 
   // ── UI State ──────────────────────────────────────────────────────────────
   const [mpState,     setMpState]     = useState('loading')
@@ -114,6 +115,8 @@ export default function Enroll() {
   const [faceVisible, setFaceVisible] = useState(false)
   const [frameCount,  setFrameCount]  = useState(0)
   const [earDisplay,  setEarDisplay]  = useState(null)
+  const [guidanceHint, setGuidanceHint] = useState('')
+  const [showBeepFlash, setShowBeepFlash] = useState(false)
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -162,6 +165,8 @@ export default function Enroll() {
     if (!lms) return
 
     const ph = phaseRef.current
+    const shouldGuide = now - lastGuidRef.current > 250  // ~4 fps guidance updates
+    if (shouldGuide) lastGuidRef.current = now
 
     // Step 2: capture baseline landmarks on first good frame
     if (ph === 'baseline' && !baselineLmRef.current) {
@@ -173,12 +178,24 @@ export default function Enroll() {
       console.log('[Enroll] Baseline landmarks captured')
     }
 
-    // Step 3: collect yaw samples
+    // Step 3: collect yaw samples with live guidance
     if (ph === 'geometry') {
-      yawBucketRef.current.push(computeYaw(lms))
+      const yaw = computeYaw(lms)
+      yawBucketRef.current.push(yaw)
+      if (shouldGuide) {
+        const prog = Math.min(yaw / 0.08, 1.0)
+        const directionStr = instrIdx === 1 ? 'LEFT ←' : 'RIGHT →'
+        const hint = prog < 0.35
+          ? `Turn further ${directionStr} — ${Math.round(prog * 100)}% detected`
+          : prog < 0.75
+            ? `✓ Good! Keep turning ${directionStr} — ${Math.round(prog * 100)}%`
+            : `✓ ${directionStr} complete (${Math.round(prog * 100)}%)`
+        updateStep(2, { status: 'Running', score: Math.round(prog * 20), detail: hint })
+        setGuidanceHint(hint)
+      }
     }
 
-    // Step 4: collect micro snapshots
+    // Step 4: collect micro snapshots with live guidance
     if (ph === 'micro' || ph === 'micro+blink') {
       if (microSnapRef.current.length < 90) {
         const snap = []
@@ -187,16 +204,39 @@ export default function Enroll() {
         }
         microSnapRef.current.push(snap)
       }
+      if (shouldGuide && microSnapRef.current.length > 5) {
+        const v = computeVariance(microSnapRef.current)
+        const hint = `Variance: ${v.toFixed(2)} px std dev — holding still`
+        updateStep(3, { status: 'Running', score: 0, detail: hint })
+        setGuidanceHint('✓ Holding still (recording micro baseline)')
+      }
     }
 
-    // Step 5: blink detection
+    // Step 5: blink detection with live guidance
     if ((ph === 'blink' || ph === 'micro+blink') && beepTimeRef.current && !blinkRef.current) {
       const ear = computeEAR(lms)
       setEarDisplay(ear.toFixed(3))
+
+      if (shouldGuide && !blinkRef.current) {
+        const hint = ear < 0.23
+          ? '⚡ Almost! Close eyes fully'
+          : `Blink! EAR: ${ear.toFixed(3)} → need < 0.20`
+        updateStep(4, { status: 'Running', score: 0, detail: hint })
+        setGuidanceHint(hint)
+      }
+
       if (ear < 0.20) {
         blinkRef.current = true
         reactionMsRef.current = Date.now() - beepTimeRef.current
         console.log('[Enroll] Blink detected! EAR:', ear.toFixed(3), '| RT:', reactionMsRef.current, 'ms')
+        const rt = reactionMsRef.current
+        const pts = rt >= 100 && rt <= 500 ? 20 : (rt > 500 && rt <= 800 ? 12 : 5)
+        updateStep(4, {
+          status: 'Pass',
+          score: pts,
+          detail: `Baseline reaction: ${rt} ms — stored`,
+        })
+        setGuidanceHint(`✓ Blink detected in ${rt} ms!`)
       }
     }
   }
@@ -304,6 +344,8 @@ export default function Enroll() {
     reactionMsRef.current = 0
     setStepSt(ENROLL_STEPS.map(() => ({ status: 'Pending', score: 0, detail: '' })))
     setEarDisplay(null)
+    setGuidanceHint('')
+    setShowBeepFlash(false)
     setPhase('running')
 
     // Start session
@@ -348,6 +390,7 @@ export default function Enroll() {
     await countdown(INSTRUCTIONS[2].duration)
 
     phaseRef.current = 'idle'
+    setGuidanceHint('')
     const yaws    = yawBucketRef.current
     const maxYaw  = yaws.length > 0 ? Math.max(...yaws) : 0
     const yawGood = maxYaw > 0.08
@@ -366,6 +409,8 @@ export default function Enroll() {
     const beepTimer  = setTimeout(() => {
       if (abortRef.current) return
       playBeep()
+      setShowBeepFlash(true)
+      setTimeout(() => setShowBeepFlash(false), 800)
       beepTimeRef.current  = Date.now()
       phaseRef.current     = 'micro+blink'
       setInstrIdx(4)
@@ -380,12 +425,16 @@ export default function Enroll() {
       await countdown(3000)
     }
     if (!beepTimeRef.current) {
-      playBeep(); beepTimeRef.current = Date.now()
+      playBeep()
+      setShowBeepFlash(true)
+      setTimeout(() => setShowBeepFlash(false), 800)
+      beepTimeRef.current = Date.now()
       phaseRef.current = 'blink'; setInstrIdx(4)
       await countdown(3000)
     }
 
     phaseRef.current = 'idle'
+    setGuidanceHint('')
 
     const variance = computeVariance(microSnapRef.current)
     updateStep(3, {
@@ -466,7 +515,7 @@ export default function Enroll() {
   // ── Render: Main enrollment flow ──────────────────────────────────────────
 
   const currentInstrText = phase === 'running'
-    ? INSTRUCTIONS[instrIdx]?.text
+    ? (guidanceHint || INSTRUCTIONS[instrIdx]?.text)
     : mpState === 'loading'
       ? '● Initialising face detection…'
       : 'Position face in oval, then click Start'
@@ -503,6 +552,11 @@ export default function Enroll() {
                   ) : (
                     <>
                       <video ref={videoRef} style={s.video} autoPlay muted playsInline />
+                      {showBeepFlash && (
+                        <div style={s.beepFlashOverlay}>
+                          ♪ BEEP! BLINK NOW ♪
+                        </div>
+                      )}
                       <div style={{
                         ...s.oval,
                         borderColor: faceVisible ? 'var(--iob-gold)' : '#555',
@@ -624,6 +678,13 @@ const s = {
     position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
     width: '42%', paddingBottom: '56%', border: '3px solid', borderRadius: '50%',
     pointerEvents: 'none', transition: 'border-color 0.4s, box-shadow 0.4s',
+  },
+  beepFlashOverlay: {
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: 'rgba(255, 179, 0, 0.45)',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    color: '#FFF', fontSize: 24, fontWeight: 900,
+    zIndex: 10, animation: 'pulse 0.4s infinite',
   },
   stepBadge: {
     position: 'absolute', top: 10, right: 10,
